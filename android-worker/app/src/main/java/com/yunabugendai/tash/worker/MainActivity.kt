@@ -3,7 +3,6 @@ package com.yunabugendai.tash.worker
 import android.app.*
 import android.os.Bundle
 import android.os.Build
-import android.view.Gravity
 import android.widget.*
 import org.json.JSONObject
 import java.util.UUID
@@ -20,6 +19,10 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val mem = ActivityManager.MemoryInfo()
+        (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mem)
+        AndroidWorkerClient.MainActivityHolder.memoryInfo = mem
+
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 32, 32, 32) }
         fun field(hint: String, value: String = ""): EditText = EditText(this).apply { this.hint = hint; setText(value) }
         host = field("Master IP")
@@ -49,9 +52,7 @@ class MainActivity : Activity() {
             override fun onStatus(text: String) = runOnUiThread { status.text = text }
             override fun onConnected() = runOnUiThread { connect.isEnabled = true; connect.text = "Disconnect" }
             override fun onDisconnected() = runOnUiThread { connect.isEnabled = true; connect.text = "Connect" }
-        }).also {
-            it.start(host.text.toString().trim(), port.text.toString().toIntOrNull() ?: 8765, code.text.toString().trim())
-        }
+        }).also { it.start(host.text.toString().trim(), port.text.toString().toIntOrNull() ?: 8765, code.text.toString().trim()) }
     }
 
     override fun onDestroy() { client?.disconnect(); super.onDestroy() }
@@ -62,13 +63,12 @@ private class AndroidWorkerClient(private val workerName: String, private val li
     private val executor = Executors.newSingleThreadExecutor()
     private var socket: java.net.Socket? = null
     private var running = false
-    private var workerId = UUID.randomUUID().toString().replace("-", "").take(12)
+    private val workerId = UUID.randomUUID().toString().replace("-", "").take(12)
     private var token: String? = null
     private var reconnect = false
     private var masterHost = ""
     private var masterPort = 8765
     private var pairingCode = ""
-    private var currentJob: Thread? = null
     @Volatile private var cancelled = false
 
     fun isConnected() = running && socket?.isConnected == true
@@ -80,7 +80,7 @@ private class AndroidWorkerClient(private val workerName: String, private val li
 
     fun disconnect() {
         running = false; cancelled = true
-        try { send("DISCONNECT", JSONObject()) } catch (_: Exception) {}
+        try { socket?.getOutputStream()?.bufferedWriter(Charsets.UTF_8)?.let { write(it, envelope("DISCONNECT", JSONObject())) } } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
         listener.onDisconnected()
     }
@@ -90,16 +90,12 @@ private class AndroidWorkerClient(private val workerName: String, private val li
         while (running) {
             try {
                 listener.onStatus("Connecting to $masterHost:$masterPort...")
-                socket = java.net.Socket()
-                socket!!.connect(java.net.InetSocketAddress(masterHost, masterPort), 5000)
+                socket = java.net.Socket().also { it.connect(java.net.InetSocketAddress(masterHost, masterPort), 5000) }
                 val input = socket!!.getInputStream().bufferedReader(Charsets.UTF_8)
                 val output = socket!!.getOutputStream().bufferedWriter(Charsets.UTF_8)
                 val register = if (reconnect && token != null) "RECONNECT" else "REGISTER"
                 val payload = JSONObject().apply {
-                    put("version", "1.0")
-                    put("worker_id", workerId)
-                    put("name", workerName)
-                    put("sysinfo", sysInfo())
+                    put("version", "1.0"); put("worker_id", workerId); put("name", workerName); put("sysinfo", sysInfo())
                     if (register == "REGISTER") put("pairing_code", pairingCode) else put("token", token)
                 }
                 write(output, envelope(register, payload))
@@ -126,10 +122,7 @@ private class AndroidWorkerClient(private val workerName: String, private val li
                 socket = null
                 if (running) listener.onDisconnected()
             }
-            if (running) {
-                Thread.sleep(backoff)
-                backoff = minOf(30000L, backoff * 2)
-            }
+            if (running) { Thread.sleep(backoff); backoff = minOf(30000L, backoff * 2) }
         }
     }
 
@@ -151,7 +144,7 @@ private class AndroidWorkerClient(private val workerName: String, private val li
                 val p = msg.getJSONObject("payload"); val id = p.getInt("chunk_id")
                 write(output, envelope("TASK_ACK", JSONObject().put("chunk_id", id)))
                 cancelled = false
-                currentJob = Thread { executeTask(id, p, output) }.also { it.start() }
+                Thread { executeTask(id, p, output) }.start()
             }
             "TASK_CANCEL" -> cancelled = true
             "PAUSE" -> listener.onStatus("Paused")
@@ -164,38 +157,28 @@ private class AndroidWorkerClient(private val workerName: String, private val li
     private fun executeTask(chunkId: Int, p: JSONObject, output: java.io.BufferedWriter) {
         try {
             if (p.getString("task_type") != "cpu_benchmark") throw IllegalArgumentException("Unsupported task type")
-            val params = p.getJSONObject("params")
-            val start = params.getLong("start"); val end = params.getLong("end")
-            val t0 = System.nanoTime(); var sum = 0.0; var count = 0L
-            var x = start
+            val params = p.getJSONObject("params"); val start = params.getLong("start"); val end = params.getLong("end")
+            val t0 = System.nanoTime(); var sum = 0.0; var count = 0L; var x = start
             while (x < end) {
                 if (cancelled) { write(output, envelope("TASK_FAILED", JSONObject().put("chunk_id", chunkId).put("error", "cancelled"))); return }
                 sum += f(x); count++; x++
             }
             val elapsed = (System.nanoTime() - t0) / 1_000_000_000.0
-            val result = JSONObject().apply {
-                put("start", start); put("end", end); put("count", count); put("sum", sum)
-                put("digest", sampleDigest(start, end)); put("compute_seconds", elapsed)
-            }
+            val result = JSONObject().apply { put("start", start); put("end", end); put("count", count); put("sum", sum); put("digest", sampleDigest(start, end)); put("compute_seconds", elapsed) }
             write(output, envelope("TASK_COMPLETE", JSONObject().put("chunk_id", chunkId).put("result", result)))
             listener.onStatus("Completed chunk $chunkId in %.3fs".format(elapsed))
-        } catch (e: Exception) {
-            write(output, envelope("TASK_FAILED", JSONObject().put("chunk_id", chunkId).put("error", e.toString())))
-        }
+        } catch (e: Exception) { write(output, envelope("TASK_FAILED", JSONObject().put("chunk_id", chunkId).put("error", e.toString()))) }
     }
 
     private fun f(x: Long): Double {
         val d = x.toDouble()
         var v = kotlin.math.sin(d) * kotlin.math.cos(d / 3.0 + 1.0)
-        v += kotlin.math.sqrt(kotlin.math.abs(d) + 1.0)
-        v += kotlin.math.ln(kotlin.math.abs(d) + 2.0)
-        return v
+        v += kotlin.math.sqrt(kotlin.math.abs(d) + 1.0); v += kotlin.math.ln(kotlin.math.abs(d) + 2.0); return v
     }
 
     private fun sampleDigest(start: Long, end: Long, sampleSize: Int = 8): String {
         if (end <= start) return sha256("")
-        val step = maxOf(1L, (end - start) / sampleSize)
-        val sb = StringBuilder(); var x = start
+        val step = maxOf(1L, (end - start) / sampleSize); val sb = StringBuilder(); var x = start
         while (x < end) { sb.append(x).append(':').append("%.10f".format(java.util.Locale.US, f(x))); x += step }
         return sha256(sb.toString())
     }
@@ -210,6 +193,5 @@ private class AndroidWorkerClient(private val workerName: String, private val li
 
     private fun envelope(type: String, payload: JSONObject) = JSONObject().apply { put("type", type); put("msg_id", UUID.randomUUID().toString().replace("-", "")); put("ts", System.currentTimeMillis() / 1000.0); put("version", "1.0"); put("payload", payload) }
     private fun write(out: java.io.BufferedWriter, obj: JSONObject) { synchronized(out) { out.write(obj.toString()); out.newLine(); out.flush() } }
-
     object MainActivityHolder { lateinit var memoryInfo: android.app.ActivityManager.MemoryInfo }
 }
