@@ -1,0 +1,4 @@
+psutil>=5.9.0
+
+# Optional, for NVIDIA GPU stats (falls back to nvidia-smi or "N/A" without it):
+# GPUtil>=1.4.0
